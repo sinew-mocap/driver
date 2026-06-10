@@ -9,7 +9,7 @@
 # the dev superbuild (a parent CMakeLists) CMAKE_SOURCE_DIR differs, so it no-ops.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     cmake_minimum_required(VERSION 3.19)
-    project(driver C CXX)
+    project(driver VERSION 0.4.0 LANGUAGES C CXX)
     set(CMAKE_CXX_STANDARD 20)
     set(CMAKE_C_STANDARD 11)
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -50,7 +50,12 @@ target_include_directories(sinew_tui PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/core"       # sinew_protocol.h, hwid_table.h, nonic.h
     "${CMAKE_CURRENT_SOURCE_DIR}/ports"      # frame_source.h, tracker_sink.h
 )
-target_compile_definitions(sinew_tui PRIVATE SINEW_VERSION="${PROJECT_VERSION}")
+# Version stamped into `sinew_tui --version`: a -DSINEW_VERSION override (the
+# release workflow passes the git tag) wins; otherwise the project() version.
+if(NOT SINEW_VERSION)
+    set(SINEW_VERSION "${PROJECT_VERSION}")
+endif()
+target_compile_definitions(sinew_tui PRIVATE SINEW_VERSION="${SINEW_VERSION}")
 target_link_libraries(sinew_tui PRIVATE
     ftxui::screen
     ftxui::dom
