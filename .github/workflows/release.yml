@@ -32,7 +32,11 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          ver="${{ github.event.inputs.tag || github.ref_name }}"
+          ver="${ver#v}"   # strip leading v: v0.4.0 -> 0.4.0
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSINEW_VERSION="$ver"
 
       - name: Build
         run: cmake --build build --config Release --parallel
