@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and release (e.g. v0.4.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The scoop manifest pulls releases/download/v$version/sinew_tui.exe,
+          # so the Windows asset MUST be named exactly sinew_tui.exe.
+          - os: windows-latest
+            asset: sinew_tui.exe
+          - os: macos-latest
+            asset: sinew_tui-macos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install
+        run: cmake --install build --config Release --prefix dist
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p out
+          # install() drops sinew_tui(.exe) at the prefix root (RUNTIME DESTINATION .)
+          bin=$(find dist -maxdepth 2 -name 'sinew_tui*' -type f | head -n1)
+          test -n "$bin" || { echo "sinew_tui not found under dist/"; exit 1; }
+          cp "$bin" "out/${{ matrix.asset }}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: out/${{ matrix.asset }}
+          fail_on_unmatched_files: true
