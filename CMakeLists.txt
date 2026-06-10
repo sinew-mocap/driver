@@ -93,4 +93,12 @@ if(SINEW_TESTS)
     target_include_directories(driver_proptest PRIVATE core)
     target_link_libraries(driver_proptest PRIVATE rapidcheck)
     add_test(NAME driver_proptest COMMAND driver_proptest)
+
+    # FrameSource round-trip through the rawlog_source adapter (no rapidcheck,
+    # no serial hardware — replays a .rawlog off disk).
+    add_executable(driver_frame_source_test
+        tests/test_frame_source.c
+        adapters/rawlog_source.c)
+    target_include_directories(driver_frame_source_test PRIVATE adapters ports core)
+    add_test(NAME driver_frame_source COMMAND driver_frame_source_test)
 endif()
