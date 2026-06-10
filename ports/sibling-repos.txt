@@ -1,0 +1,5 @@
+# driver/ports — sibling sinew-mocap repos to clone side-by-side in ~/ for this
+# cluster to build.  In-process deps link ../<repo>; network deps use OSC.
+#
+# build (link): none — the driver is self-contained (owns the /sinew codec).
+# network (OSC out): /sinew/tracker + /sinew/accel on UDP 39539  -> viewer
