@@ -3,11 +3,22 @@
 // .rawlog, replay it, and check the bytes round-trip and end-of-stream reports
 // cleanly.  Keeps the (otherwise hardware-only) FrameSource boundary covered in
 // CI, and is the "recorded .rawlog in CI" the port header promises.
+//
+// NB: uses an always-active CHECK (not assert) — Release builds define NDEBUG,
+// which would compile assert() and its side-effecting calls out entirely.
 #include "rawlog_source.h"
 
-#include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+static int g_fail = 0;
+#define CHECK(cond)                                                       \
+	do {                                                                  \
+		if (!(cond)) {                                                    \
+			fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #cond);       \
+			g_fail = 1;                                                   \
+		}                                                                 \
+	} while (0)
 
 int main(void) {
 	const char *path = "test_frame_source.rawlog";
@@ -19,7 +30,10 @@ int main(void) {
 	}
 
 	FILE *fp = fopen(path, "wb");
-	assert(fp);
+	CHECK(fp != NULL);
+	if (!fp) {
+		return 1;
+	}
 	fprintf(fp, "12345,");
 	for (int i = 0; i < 36; i++) {
 		fprintf(fp, "%02x", a[i]);  // lower-case hex
@@ -33,21 +47,26 @@ int main(void) {
 	fclose(fp);
 
 	FrameSource src;
-	assert(rawlog_source_open(path, &src) == 0);
-
-	uint8_t got[36];
-	assert(src.next(src.ctx, got) == 1);
-	assert(memcmp(got, a, 36) == 0);
-	assert(src.next(src.ctx, got) == 1);
-	assert(memcmp(got, b, 36) == 0);
-	assert(src.next(src.ctx, got) == 0);  // clean end-of-stream
-	src.close(src.ctx);
+	int rc = rawlog_source_open(path, &src);
+	CHECK(rc == 0);
+	if (rc == 0) {
+		uint8_t got[36];
+		CHECK(src.next(src.ctx, got) == 1);
+		CHECK(memcmp(got, a, 36) == 0);
+		CHECK(src.next(src.ctx, got) == 1);
+		CHECK(memcmp(got, b, 36) == 0);
+		CHECK(src.next(src.ctx, got) == 0);  // clean end-of-stream
+		src.close(src.ctx);
+	}
 
 	// A missing file is a clean open failure, not a crash.
 	FrameSource missing;
-	assert(rawlog_source_open("does-not-exist.rawlog", &missing) < 0);
+	CHECK(rawlog_source_open("does-not-exist.rawlog", &missing) < 0);
 
 	remove(path);
+	if (g_fail) {
+		return 1;
+	}
 	printf("test_frame_source: OK\n");
 	return 0;
 }
