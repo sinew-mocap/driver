@@ -12,6 +12,7 @@
 #include "hwid_table.h"
 #include "sinew_protocol.h"  // the wire codec: ImuFrame, parse_frame, build_tracker/accel
 #include "tracker_sink.h"    // the driven port the OSC-out adapter implements
+#include "frame_source.h"    // the driven port the serial read side implements
 
 #include <ctype.h>
 #include <math.h>
@@ -978,6 +979,22 @@ static int read_frame(serial_handle_t fd, uint8_t *buf) {
 	return -1;
 }
 
+// ── FrameSource adapter: the live serial port ───────────────────────────────
+// Wraps a connected dongle handle as a FrameSource so the run loop pulls frames
+// through the driven port rather than calling the raw reader directly.
+// rawlog_source is the other FrameSource implementation (replay from disk).
+typedef struct {
+	serial_handle_t fd;
+} SerialSourceCtx;
+
+static int serial_source_next(void *c, uint8_t *frame36) {
+	SerialSourceCtx *s = (SerialSourceCtx *)c;
+	return read_frame(s->fd, frame36);  // 1 = frame, <0 = disconnect (FrameSource contract)
+}
+static void serial_source_close(void *c) {
+	(void)c;  // the run loop owns the fd lifetime (publishes/closes it under lock)
+}
+
 #define NAME_LEN 48
 
 static uint8_t g_last_ctr[SINEW_JOINT_COUNT];
@@ -1093,6 +1110,10 @@ void sinew_driver_run(const SinewConfig *cfg) {
 		}
 		DLOG(cfg, "Serial connected.  Streaming...\n");
 
+		// Drive the read side through the FrameSource port (serial adapter).
+		SerialSourceCtx srcctx = {fd};
+		FrameSource src = {&srcctx, serial_source_next, serial_source_close};
+
 		// Publish fd so the host-write API can use it.  Send the
 		// initial wake_up immediately: first thing out the door is a
 		// wake_up to OMNI.
@@ -1119,11 +1140,12 @@ void sinew_driver_run(const SinewConfig *cfg) {
 				sinew_send_wake_up();
 			}
 
-			if (read_frame(fd, raw) < 0) {
+			if (src.next(src.ctx, raw) < 0) {
 				DLOG(cfg, "Serial disconnected — reconnecting\n");
 				WLOCK();
 				g_active_fd = SERIAL_INVALID;
 				WUNLOCK();
+				src.close(src.ctx);
 				serial_close(fd);
 				break;
 			}
