@@ -2,6 +2,7 @@
 // Copyright (c) 2026-present K. S. Ernest (iFire) Lee
 #include "osc_receiver.hpp"
 #include "nonic.h"
+#include "tracker_source.h"  // the driven port the inbound /sinew socket implements
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -36,6 +37,27 @@ static int close_sock(sock_native_t s) {
 	return ::close(s);
 }
 #endif
+
+// ── TrackerSource adapter: the inbound /sinew UDP socket ─────────────────────
+// The read twin of TrackerSink: the monitor mirror (39540) the TUI observes.
+// OscReceiver pulls raw /sinew packets through this port and decodes them; the
+// socket lifetime stays with OscReceiver (close() is a no-op here).
+namespace {
+struct UdpTrackerSourceCtx {
+	std::intptr_t sock;
+};
+int udp_tracker_next(void *ctx, uint8_t *osc, size_t cap, size_t *len) {
+	UdpTrackerSourceCtx *c = static_cast<UdpTrackerSourceCtx *>(ctx);
+	int n = recv((sock_native_t)c->sock, (char *)osc, (int)cap, 0);
+	if (n > 0) {
+		*len = (size_t)n;
+		return 1;
+	}
+	return n == 0 ? 0 : -1;  // 0 = clean close, <0 = error/closed socket
+}
+void udp_tracker_close(void *) {
+}
+}  // namespace
 
 OscReceiver::OscReceiver(uint16_t port) : port_(port) {
 }
@@ -98,12 +120,17 @@ void OscReceiver::purgeOlderThan(float seconds) {
 
 void OscReceiver::run() {
 	uint8_t buf[4096];
+	UdpTrackerSourceCtx sctx{sock_};
+	TrackerSource src{&sctx, udp_tracker_next, udp_tracker_close};
 	while (running_) {
-		int n = recv((sock_native_t)sock_, (char *)buf, (int)sizeof(buf), 0);
-		if (n > 0) {
-			process(buf, (size_t)n);
+		size_t len = 0;
+		int rc = src.next(src.ctx, buf, sizeof(buf), &len);
+		if (rc > 0) {
+			process(buf, len);
 		}
+		// rc <= 0 (no data / closed socket): loop; running_ gates shutdown.
 	}
+	src.close(src.ctx);
 }
 
 std::string OscReceiver::readString(const uint8_t *buf, size_t len, size_t &pos) {

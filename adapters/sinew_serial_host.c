@@ -13,6 +13,7 @@
 #include "sinew_protocol.h"  // the wire codec: ImuFrame, parse_frame, build_tracker/accel
 #include "tracker_sink.h"    // the driven port the OSC-out adapter implements
 #include "frame_source.h"    // the driven port the serial read side implements
+#include "command_sink.h"    // the driven port the serial write side implements
 
 #include <ctype.h>
 #include <math.h>
@@ -298,6 +299,19 @@ static int serial_write_n(serial_handle_t fd, const uint8_t *buf, size_t n) {
 #endif
 }
 
+// ── CommandSink adapter: the serial write side (host -> dongle) ──────────────
+// The write twin of the serial FrameSource on the same link.  Every sinew_send_*
+// builds its 36-byte frame under WLOCK with g_active_fd validated, then emits it
+// through this port — a faithful wrap of serial_write_n on the active handle.
+static int serial_command_send(void *ctx, const uint8_t *frame36) {
+	(void)ctx;  // the active handle is the driver-owned g_active_fd (held under WLOCK)
+	return serial_write_n(g_active_fd, frame36, FRAME_BYTES);
+}
+static void serial_command_close(void *ctx) {
+	(void)ctx;  // the run loop owns the fd lifetime
+}
+static CommandSink g_cmd_sink = {NULL, serial_command_send, serial_command_close};
+
 // Increment counter mod 0x7FFF (avoid 0).  Caller must hold WLOCK.
 static uint16_t next_msg_locked(void) {
 	g_msg_counter++;
@@ -328,7 +342,7 @@ int sinew_send_wake_up(void) {
 	frame[14] = 0xB4;                         // magic byte in every wake_up
 	frame[34] = 0xAF;
 	frame[35] = 0xAF;
-	int ok = serial_write_n(fd, frame, sizeof(frame));
+	int ok = g_cmd_sink.send(g_cmd_sink.ctx, frame);
 	if (ok) {
 		g_last_wake_ms = now_ms();
 	}
@@ -367,7 +381,7 @@ int sinew_send_activate(uint8_t p_node, const uint8_t p_payload22[22]) {
 	memcpy(frame + 12, p_payload22, 22);
 	frame[34] = 0xAF;
 	frame[35] = 0xAF;
-	int ok = serial_write_n(fd, frame, sizeof(frame));
+	int ok = g_cmd_sink.send(g_cmd_sink.ctx, frame);
 	WUNLOCK();
 	return ok;
 }
@@ -521,7 +535,7 @@ int sinew_send_mag_strength(uint8_t p_node, int p_level) {
 	frame[12 + 18] = (uint8_t)(14 - p_level);  // inverted level; cal bytes preserved
 	frame[34] = 0xAF;
 	frame[35] = 0xAF;
-	int ok = serial_write_n(fd, frame, sizeof(frame));
+	int ok = g_cmd_sink.send(g_cmd_sink.ctx, frame);
 	WUNLOCK();
 	return ok;
 }
@@ -554,7 +568,7 @@ int sinew_send_shutdown(uint8_t p_node) {
 	frame[7] = (uint8_t)((msg >> 8) & 0x7F);  // shutdown clears 0x8000
 	frame[34] = 0xAF;
 	frame[35] = 0xAF;
-	int ok = serial_write_n(fd, frame, sizeof(frame));
+	int ok = g_cmd_sink.send(g_cmd_sink.ctx, frame);
 	WUNLOCK();
 	return ok;
 }
@@ -588,7 +602,7 @@ int sinew_send_command(uint8_t opcode, uint8_t target, int work_bit, const uint8
 	}
 	frame[34] = 0xAF;
 	frame[35] = 0xAF;
-	int ok = serial_write_n(fd, frame, sizeof(frame));
+	int ok = g_cmd_sink.send(g_cmd_sink.ctx, frame);
 	WUNLOCK();
 	return ok;
 }
