@@ -24,13 +24,16 @@ extern "C" {
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <set>
+#include <thread>
 
 using namespace ftxui;
 
@@ -386,6 +389,8 @@ int main(int argc, char **argv) {
 			    "Options:\n"
 			    "  --port DEV        Force serial port (default: probe ports)\n"
 			    "  --ip IP           OSC destination IP    (default 127.0.0.1)\n"
+			    "  --headless        Run as a service: no TUI, just stream OSC to\n"
+			    "                    --ip:appPort until SIGINT/SIGTERM\n"
 			    "  --verbose         Log per-frame diagnostics\n"
 			    "  --raw-log PATH    Dump raw 36-byte frames as ms,hex72\\n\n"
 			    "\n"
@@ -415,9 +420,12 @@ int main(int argc, char **argv) {
 	};
 	std::vector<PendingCmd> pending_cmds;
 	int pending_mag_level = -1;  // --mag: fired via sinew_send_mag_strength (cal-replay)
+	bool headless = false;       // --headless: run as a service, no TUI (see below)
 	for (int i = 1; i < argc; ++i) {
 		if (std::string(argv[i]) == "--port" && i + 1 < argc) {
 			strncpy(drv.serial_port, argv[++i], sizeof(drv.serial_port) - 1);
+		} else if (std::string(argv[i]) == "--headless") {
+			headless = true;
 		} else if (std::string(argv[i]) == "--ip" && i + 1 < argc) {
 			strncpy(drv.dest_ip, argv[++i], sizeof(drv.dest_ip) - 1);
 		} else if (std::string(argv[i]) == "--verbose") {
@@ -730,6 +738,47 @@ int main(int argc, char **argv) {
 			std::ofstream(log_path, std::ios::app)
 			    << std::format("[0.0s] Loaded {} mag-cal payloads from {}\n", m, p);
 		}
+	}
+
+	// Headless service mode: the C driver thread (started above) is the whole
+	// data path — it reads the dongle and emits OSC to app_port@dest_ip on its
+	// own.  No FTXUI screen and no monitor receiver; activate the trackers once,
+	// then block until systemd asks us to stop (SIGTERM) or Ctrl-C (SIGINT).
+	if (headless) {
+		// Stop the TUI-only helpers that were started above (the monitor tap and
+		// the redraw ticker); the driver thread keeps streaming OSC untouched.
+		alive = false;
+		refresher.join();
+		receiver.stop();
+
+		std::thread([&]() {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+			static constexpr uint8_t kZeros22[22]{};
+			for (uint8_t node = 0; node <= 14; ++node) {
+				if (sinew_have_activate_for(node)) {
+					sinew_send_activate_known(node);
+				} else {
+					sinew_send_activate(node, kZeros22);
+				}
+			}
+		}).detach();
+
+		static std::atomic<bool> run{true};
+		std::signal(SIGINT, [](int) { run = false; });
+		std::signal(SIGTERM, [](int) { run = false; });
+		while (run.load()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		}
+
+		sinew_driver_stop();
+		driver_thread.join();
+		if (drv_log) {
+			fclose(drv_log);
+		}
+		if (raw_log) {
+			fclose(raw_log);
+		}
+		return 0;
 	}
 
 	// Last known TrackerState per joint — persisted across frames so standby
