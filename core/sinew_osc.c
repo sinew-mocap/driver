@@ -66,3 +66,55 @@ size_t build_accel(uint8_t *buf, const char *name, float ax, float ay, float az)
 	o = osc_float(buf, o, az);
 	return o;
 }
+
+size_t build_mag(uint8_t *buf, const char *name, float mx, float my, float mz) {
+	size_t o = osc_string(buf, 0, "/sinew/mag");
+	o = osc_string(buf, o, ",sfff");
+	o = osc_string(buf, o, name);
+	o = osc_float(buf, o, mx);
+	o = osc_float(buf, o, my);
+	o = osc_float(buf, o, mz);
+	return o;
+}
+
+size_t build_calib_status(uint8_t *buf, const char *name, float progress) {
+	size_t o = osc_string(buf, 0, "/sinew/calib");
+	o = osc_string(buf, o, ",sf");
+	o = osc_string(buf, o, name);
+	o = osc_float(buf, o, progress);
+	return o;
+}
+
+size_t build_magqual(uint8_t *buf, const char *name, float mag_magnitude) {
+	size_t o = osc_string(buf, 0, "/sinew/magqual");
+	o = osc_string(buf, o, ",sf");
+	o = osc_string(buf, o, name);
+	return osc_float(buf, o, mag_magnitude);
+}
+
+size_t build_battery(uint8_t *buf, const char *name, float level) {
+	size_t o = osc_string(buf, 0, "/sinew/battery");
+	o = osc_string(buf, o, ",sf");
+	o = osc_string(buf, o, name);
+	return osc_float(buf, o, level);
+}
+
+size_t build_state_status(uint8_t *buf, const char *name, int state) {
+	size_t o = osc_string(buf, 0, "/sinew/state");
+	o = osc_string(buf, o, ",si");
+	o = osc_string(buf, o, name);
+	uint32_t v = (uint32_t)state;
+	buf[o+0]=(uint8_t)(v>>24); buf[o+1]=(uint8_t)(v>>16);
+	buf[o+2]=(uint8_t)(v>>8);  buf[o+3]=(uint8_t)(v>>0);
+	return o + 4;
+}
+
+size_t build_magcal(uint8_t *buf, const char *name, float mx, float my, float mz) {
+	size_t o = osc_string(buf, 0, "/sinew/magcal");
+	o = osc_string(buf, o, ",sfff");
+	o = osc_string(buf, o, name);
+	o = osc_float(buf, o, mx);
+	o = osc_float(buf, o, my);
+	o = osc_float(buf, o, mz);
+	return o;
+}

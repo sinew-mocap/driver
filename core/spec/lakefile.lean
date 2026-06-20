@@ -7,8 +7,11 @@
 import Lake
 open Lake DSL
 
--- Property-based testing: Plausible (QuickCheck for Lean4), pinned to our toolchain.
-require plausible from git "https://github.com/leanprover-community/plausible" @ "v4.30.0-rc2"
+-- Property-based testing: plausible-witness-dag (fire's iterative-deepening
+-- witness search built on Plausible/QuickCheck for Lean4).  Transitively pulls
+-- in leanprover-community/plausible, so we don't need a separate require.
+require «plausible-witness-dag» from git
+  "https://github.com/fire/plausible-witness-dag" @ "160b94c9c6eed3bb9ebffce919fc6f989dcafba8"
 
 package "SinewDriver" where
   version := v!"0.1.0"
