@@ -122,6 +122,7 @@ int parse_frame(const uint8_t *b, ImuFrame *out) {
 		out->mag_valid = (get_u8(b, 33) != 0);
 		out->mag =
 		    (Accel){(float)get_i16le(b, 24), (float)get_i16le(b, 26), (float)get_i16le(b, 28)};
+		out->raw27 = 0; out->raw28 = 0; out->raw29 = 0;
 		return SINEW_FRAME_OK;
 	}
 
@@ -144,6 +145,9 @@ int parse_frame(const uint8_t *b, ImuFrame *out) {
 		out->accel = raw_to_accel(get_i16le(b, 18), get_i16le(b, 20), get_i16le(b, 22));
 		out->mag_valid = 0;  // burst frames carry hwid at 24-26, no magnetometer
 		out->mag = (Accel){0.f, 0.f, 0.f};
+		out->raw27 = b[27];   // unvalidated trailing field — potential quality/battery bytes
+		out->raw28 = b[28];
+		out->raw29 = b[29];
 		return SINEW_FRAME_OK;
 	}
 

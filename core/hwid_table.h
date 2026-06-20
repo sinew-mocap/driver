@@ -19,7 +19,10 @@ typedef struct {
 extern const SinewHwidEntry *SINEW_HWID_TABLE;
 extern int SINEW_HWID_TABLE_SIZE;
 
-// Load from hwid_table.ini. Returns entries loaded, 0 on failure.
+// Initialise the built-in hard-coded table (idempotent).
+void sinew_hwid_init(void);
+
+// Load from hwid_table.ini — kept for API compat, now ignores path.
 int sinew_hwid_load(const char *p_path);
 
 // Linear lookup; returns NULL if hwid not found.

@@ -43,6 +43,11 @@ typedef struct {
 	Accel accel;
 	Accel mag;      // magnetometer (bytes 24-29); only valid in standard layout
 	int mag_valid;  // 1 = standard layout (byte 33 != 0), mag is clean; 0 = skip
+	// Burst-frame trailing bytes 27-29 (0x3a "unvalidated field"):
+	// likely compass quality / battery level — expose raw for user interpretation.
+	uint8_t raw27;   // byte 27
+	uint8_t raw28;   // byte 28 (commonly battery level 0-100 or 0-255)
+	uint8_t raw29;   // byte 29
 } ImuFrame;
 
 // parse_frame result (= Sinew.Protocol.ParseResult, the relevant cases).
