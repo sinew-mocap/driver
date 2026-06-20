@@ -20,13 +20,43 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
+      # driver links mount_drift via add_subdirectory(../mount_drift); check out both.
       - uses: actions/checkout@v4
+        with:
+          path: driver
+      - uses: actions/checkout@v4
+        with:
+          repository: sinew-mocap/mount_drift
+          # TODO: revert ref once sinew-mocap/mount_drift#3 merges to main.
+          ref: b4f99cfce4d3fb7de95337e3fa1550236414be60
+          path: mount_drift
+          token: ${{ secrets.SINEW_CI_TOKEN || github.token }}
 
       - name: Configure
-        run: cmake -S . -B build -DSINEW_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S driver -B build -DSINEW_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
+
+  lean-proptest:
+    name: lean-proptest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            -sSf | sh -s -- --default-toolchain none -y
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Build Lean spec
+        working-directory: core/spec
+        run: lake build
+
+      - name: Run proptest
+        working-directory: core/spec
+        run: lake exe proptest

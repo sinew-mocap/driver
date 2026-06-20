@@ -3,10 +3,11 @@
 //
 // host/driver — the slim rebocap driver's serial + UDP adapters around the pure
 // core/protocol codec.  Reads 36-byte frames off the serial port, decodes them
-// with parse_frame, and emits the /sinew OSC protocol over UDP.  No calibration,
-// no fusion, no GPU: the dongle's device quaternion passes through as-is, and the
-// server does the TIC calibration + body solve.  Maps to Main (SeqRegistry,
-// runDriver) + the host-write commands + the lifecycle FSM (Lifecycle.lean).
+// with parse_frame, and emits the /sinew OSC protocol over UDP.  TIC calibration
+// (mount/drift correction via accel+mag) is applied when weights are available;
+// degrades gracefully to raw device quaternion when wtrained.bin is absent.
+// Maps to Main (SeqRegistry, runDriver) + the host-write commands + the lifecycle
+// FSM (Lifecycle.lean).
 
 #include "sinew_driver.h"
 #include "hwid_table.h"
@@ -14,6 +15,9 @@
 #include "tracker_sink.h"    // the driven port the OSC-out adapter implements
 #include "frame_source.h"    // the driven port the serial read side implements
 #include "command_sink.h"    // the driven port the serial write side implements
+#include "tic_calib.h"       // TIC mount/drift calibrator (accel + mag + quat → R_clean)
+#include "mag_calib.h"       // online hard+soft iron calibration, persisted to mag_calib.ini
+#include "triad_calib.h"     // TRIAD zero-pose reference from gravity + calibrated mag
 
 #include <ctype.h>
 #include <math.h>
@@ -113,6 +117,18 @@ static const char *SINEW_JOINT_NODE_TABLE[SINEW_JOINT_COUNT] = {
     "Hips",          "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg",
     "LeftFoot",      "RightFoot",    "Chest",         "Head",         "LeftUpperArm",
     "RightUpperArm", "LeftLowerArm", "RightLowerArm", "LeftHand",     "RightHand"};
+
+/* Rotate vector (vx,vy,vz) by unit quaternion q into (rx,ry,rz).
+   v' = q * v * q^{-1}  via  v' = v + 2w(q×v) + 2(q×(q×v)) */
+static void quat_rotate_vec(Quat q, float vx, float vy, float vz,
+                             float *rx, float *ry, float *rz) {
+	float tx = 2.f*(q.y*vz - q.z*vy);
+	float ty = 2.f*(q.z*vx - q.x*vz);
+	float tz = 2.f*(q.x*vy - q.y*vx);
+	*rx = vx + q.w*tx + q.y*tz - q.z*ty;
+	*ry = vy + q.w*ty + q.z*tx - q.x*tz;
+	*rz = vz + q.w*tz + q.x*ty - q.y*tx;
+}
 
 static int joint_index_for_name(const char *name) {
 	if (!name) {
@@ -1011,8 +1027,145 @@ static void serial_source_close(void *c) {
 
 #define NAME_LEN 48
 
-static uint8_t g_last_ctr[SINEW_JOINT_COUNT];
+// [joint][sub_idx(0-7)][flag(0-1)] dedup counters.
+// sub_idx = (sub_type >> 4) & 0x07, flag = sub_type & 0x01.
+#define SUB_MAX 8
+static uint8_t g_last_ctr[SINEW_JOINT_COUNT][SUB_MAX][2];
 static uint64_t g_t_start = 0;
+
+// Per-joint per-subidx per-flag previous quaternion for phase-alignment.
+static Quat g_prev_q[SINEW_JOINT_COUNT][SUB_MAX][2];
+
+// Which (sub_idx, flag) slots have received at least one frame per joint.
+static uint8_t g_slot_seen[SINEW_JOINT_COUNT][SUB_MAX][2];
+// Previous quaternion for the derived channel (sign continuity).
+static Quat g_prev_q_derived[SINEW_JOINT_COUNT];
+
+// Zero-pose reference captured on the first frame from each slot (powerup calibration).
+// Emitted orientation = inv(Q_ref) * Q_current  →  initial pose is always identity.
+static Quat g_ref_q[SINEW_JOINT_COUNT][SUB_MAX][2];
+static uint8_t g_ref_set[SINEW_JOINT_COUNT][SUB_MAX][2];
+
+// TRIAD-based zero-pose reference: physics-grounded using gravity + calibrated mag.
+// Replaces the TIC-snapshot reference once mag_calib bootstrap (200 frames) is done.
+static Accel   g_a_init[SINEW_JOINT_COUNT];          // accel at first valid frame (sensor frame)
+static Accel   g_m_init[SINEW_JOINT_COUNT];          // raw mag at first valid frame
+static uint8_t g_init_captured[SINEW_JOINT_COUNT];   // 1 when initial accel+mag captured
+static Quat    g_ref_triad[SINEW_JOINT_COUNT];       // TRIAD-computed reference quaternion
+static uint8_t g_ref_triad_set[SINEW_JOINT_COUNT];  // 1 when TRIAD ref is valid
+
+// ── 6D rotation merge helpers (Zhou et al., matches sixd.py) ─────────────────
+// Quaternion → 6D: first two columns of the rotation matrix.
+static void quat_to_6d(Quat q, float v[6]) {
+    float w=q.w, x=q.x, y=q.y, z=q.z;
+    v[0]=1.f-2.f*(y*y+z*z); v[1]=2.f*(x*y+w*z); v[2]=2.f*(x*z-w*y);
+    v[3]=2.f*(x*y-w*z);     v[4]=1.f-2.f*(x*x+z*z); v[5]=2.f*(y*z+w*x);
+}
+
+// Average N 6D vectors and decode via Gram-Schmidt → quaternion.
+// Matches sixd_to_R in sixd.py and sixd_to_m in tic_calib.c.
+static Quat sixd_avg_to_quat(const float sums[6], int n) {
+    float v[6]; for (int i=0;i<6;i++) v[i]=sums[i]/n;
+    float an=sqrtf(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+    if (an<1e-9f) return (Quat){1,0,0,0};
+    float ax=v[0]/an, ay=v[1]/an, az=v[2]/an;
+    float dp=ax*v[3]+ay*v[4]+az*v[5];
+    float bx=v[3]-dp*ax, by=v[4]-dp*ay, bz=v[5]-dp*az;
+    float bn=sqrtf(bx*bx+by*by+bz*bz);
+    if (bn<1e-9f) return (Quat){1,0,0,0};
+    bx/=bn; by/=bn; bz/=bn;
+    float cx=ay*bz-az*by, cy=az*bx-ax*bz, cz=ax*by-ay*bx;
+    // Rotation matrix with columns [a,b,c]: tr = ax+by+cz
+    float tr=ax+by+cz; Quat q;
+    if (tr>0.f){float s=sqrtf(tr+1.f)*2.f;
+        q=(Quat){0.25f*s,(bz-cy)/s,(cx-az)/s,(ay-bx)/s};}
+    else if (ax>by&&ax>cz){float s=sqrtf(1.f+ax-by-cz)*2.f;
+        q=(Quat){(bz-cy)/s,0.25f*s,(ay+bx)/s,(cx+az)/s};}
+    else if (by>cz){float s=sqrtf(1.f+by-ax-cz)*2.f;
+        q=(Quat){(cx-az)/s,(ay+bx)/s,0.25f*s,(cy+bz)/s};}
+    else{float s=sqrtf(1.f+cz-ax-by)*2.f;
+        q=(Quat){(ay-bx)/s,(cx+az)/s,(cy+bz)/s,0.25f*s};}
+    float nn=sqrtf(q.w*q.w+q.x*q.x+q.y*q.y+q.z*q.z);
+    if (nn>1e-9f){q.w/=nn;q.x/=nn;q.y/=nn;q.z/=nn;} return q;
+}
+
+// Returns 1 if q is within ~2° of identity — used to detect the low-power sentinel.
+// Sensors emit (1,0,0,0) when sleeping; that frame must not set the zero-pose
+// reference, must not be emitted, and must not enter the 6D derived average.
+static int quat_is_identity(Quat q) {
+    // |w| > cos(1°) ≈ 0.99985  →  angle from identity < 2°
+    float absw = q.w < 0.f ? -q.w : q.w;
+    return absw > 0.99985f;
+}
+
+// Faithful C translation of Godot's Basis(q).get_rotation_quaternion():
+//   set_quaternion → orthonormalize → det<0 flip → get_quaternion (Shepperd).
+// rows[r][c] layout matches Godot's row-major Basis.
+static Quat q_align_phase(Quat q) {
+    // --- Basis::set_quaternion ---
+    float d = q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z;
+    if (d < 1e-18f) return (Quat){1.f,0.f,0.f,0.f};
+    float s  = 2.0f / d;
+    float xs = q.x*s,  ys = q.y*s,  zs = q.z*s;
+    float wx = q.w*xs, wy = q.w*ys, wz = q.w*zs;
+    float xx = q.x*xs, xy = q.x*ys, xz = q.x*zs;
+    float yy = q.y*ys, yz = q.y*zs, zz = q.z*zs;
+    float m[3][3] = {
+        {1.f-(yy+zz), xy-wz,       xz+wy      },
+        {xy+wz,       1.f-(xx+zz), yz-wx       },
+        {xz-wy,       yz+wx,       1.f-(xx+yy) }
+    };
+
+    // --- Basis::orthonormalize() — Gram-Schmidt on columns ---
+    float c0[3]={m[0][0],m[1][0],m[2][0]};
+    float n0=sqrtf(c0[0]*c0[0]+c0[1]*c0[1]+c0[2]*c0[2]);
+    if(n0>1e-9f){c0[0]/=n0;c0[1]/=n0;c0[2]/=n0;}
+    float c1[3]={m[0][1],m[1][1],m[2][1]};
+    float d01=c1[0]*c0[0]+c1[1]*c0[1]+c1[2]*c0[2];
+    c1[0]-=d01*c0[0];c1[1]-=d01*c0[1];c1[2]-=d01*c0[2];
+    float n1=sqrtf(c1[0]*c1[0]+c1[1]*c1[1]+c1[2]*c1[2]);
+    if(n1>1e-9f){c1[0]/=n1;c1[1]/=n1;c1[2]/=n1;}
+    float c2[3]={m[0][2],m[1][2],m[2][2]};
+    float d02=c2[0]*c0[0]+c2[1]*c0[1]+c2[2]*c0[2];
+    float d12=c2[0]*c1[0]+c2[1]*c1[1]+c2[2]*c1[2];
+    c2[0]-=d02*c0[0]+d12*c1[0];c2[1]-=d02*c0[1]+d12*c1[1];c2[2]-=d02*c0[2]+d12*c1[2];
+    float n2=sqrtf(c2[0]*c2[0]+c2[1]*c2[1]+c2[2]*c2[2]);
+    if(n2>1e-9f){c2[0]/=n2;c2[1]/=n2;c2[2]/=n2;}
+    m[0][0]=c0[0];m[1][0]=c0[1];m[2][0]=c0[2];
+    m[0][1]=c1[0];m[1][1]=c1[1];m[2][1]=c1[2];
+    m[0][2]=c2[0];m[1][2]=c2[1];m[2][2]=c2[2];
+
+    // --- det < 0: scale by -1 to ensure proper rotation ---
+    float det = m[0][0]*(m[1][1]*m[2][2]-m[2][1]*m[1][2])
+               -m[1][0]*(m[0][1]*m[2][2]-m[2][1]*m[0][2])
+               +m[2][0]*(m[0][1]*m[1][2]-m[1][1]*m[0][2]);
+    if (det < 0.f) {
+        for(int r=0;r<3;r++) for(int c=0;c<3;c++) m[r][c]*=-1.f;
+    }
+
+    // --- Basis::get_quaternion() — Shepperd's method ---
+    // temp[0]=x, temp[1]=y, temp[2]=z, temp[3]=w  (Godot convention)
+    float trace = m[0][0]+m[1][1]+m[2][2];
+    float temp[4];
+    if (trace > 0.f) {
+        float sv = sqrtf(trace+1.f);
+        temp[3] = sv*0.5f;
+        sv = 0.5f/sv;
+        temp[0] = (m[2][1]-m[1][2])*sv;
+        temp[1] = (m[0][2]-m[2][0])*sv;
+        temp[2] = (m[1][0]-m[0][1])*sv;
+    } else {
+        int i = (m[0][0]<m[1][1]) ? ((m[1][1]<m[2][2])?2:1) : ((m[0][0]<m[2][2])?2:0);
+        int j = (i+1)%3, k = (i+2)%3;
+        float sv = sqrtf(m[i][i]-m[j][j]-m[k][k]+1.f);
+        temp[i]  = sv*0.5f;
+        sv = 0.5f/sv;
+        temp[3]  = (m[k][j]-m[j][k])*sv;
+        temp[j]  = (m[j][i]+m[i][j])*sv;
+        temp[k]  = (m[k][i]+m[i][k])*sv;
+    }
+    return (Quat){temp[3], temp[0], temp[1], temp[2]};  // (w,x,y,z)
+}
 
 // ── OSC-out adapter: a UDP TrackerSink (the driver's driven port) ────────────
 // Fans every /sinew packet to the consumer app (dest_ip:osc_port) and, if a
@@ -1069,6 +1222,7 @@ void sinew_config_default(SinewConfig *cfg) {
 	cfg->verbose = 0;
 	cfg->logfp = NULL;
 	cfg->rawfp = NULL;
+	strncpy(cfg->mag_calib_path, "mag_calib.ini", sizeof(cfg->mag_calib_path) - 1);
 }
 
 #define DLOG(cfg, ...)                          \
@@ -1093,9 +1247,29 @@ void sinew_driver_run(const SinewConfig *cfg) {
 	WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-	memset(g_last_ctr, 0, sizeof(g_last_ctr));
-	memset(g_sub, 0, sizeof(g_sub));
+	memset(g_last_ctr,       0, sizeof(g_last_ctr));
+	memset(g_sub,            0, sizeof(g_sub));
+	memset(g_slot_seen,      0, sizeof(g_slot_seen));
+	memset(g_ref_set,        0, sizeof(g_ref_set));
+	memset(g_init_captured,  0, sizeof(g_init_captured));
+	memset(g_ref_triad_set,  0, sizeof(g_ref_triad_set));
+	memset(g_a_init,         0, sizeof(g_a_init));
+	memset(g_m_init,         0, sizeof(g_m_init));
+	for (int i = 0; i < SINEW_JOINT_COUNT; i++) {
+		g_prev_q_derived[i] = (Quat){1.f, 0.f, 0.f, 0.f};
+		for (int s = 0; s < SUB_MAX; s++)
+			for (int f = 0; f < 2; f++) {
+				g_prev_q[i][s][f] = (Quat){1.f, 0.f, 0.f, 0.f};
+				g_ref_q[i][s][f]  = (Quat){1.f, 0.f, 0.f, 0.f};
+			}
+	}
 	joint_state_init();
+
+	// Register joint names so mag_calib can key the INI by joint label.
+	for (int i = 0; i < SINEW_JOINT_COUNT; i++)
+		mag_calib_set_joint_name(i, SINEW_JOINT_NODE_TABLE[i]);
+	if (cfg->mag_calib_path[0])
+		mag_calib_load(cfg->mag_calib_path);
 
 	UdpSinkCtx sinkctx = {udp_open(), cfg->dest_ip, cfg->osc_port, cfg->monitor_port};
 	TrackerSink sink = {&sinkctx, udp_sink_send, udp_sink_close};
@@ -1221,52 +1395,235 @@ void sinew_driver_run(const SinewConfig *cfg) {
 
 			if (joint_label && !is_burst) {
 				uint8_t sub_idx = (frame.sub_type >> 4) & 0x07;
-				if (sub_idx != 1) {
-					continue;
-				}
-
-				uint8_t ctr = (uint8_t)(frame.seq_num >> 8);
+				uint8_t flag    = frame.sub_type & 0x01;
+				uint8_t ctr     = (uint8_t)(frame.seq_num >> 8);
 				int ji = (int)node_num;
 
-				if (ctr == g_last_ctr[ji]) {
+				// Dedup per (joint, sub_idx, flag) — each unique combination is
+				// a distinct data stream and gets its own named arrow.
+				if (ctr == g_last_ctr[ji][sub_idx][flag]) {
 					continue;
 				}
-				g_last_ctr[ji] = ctr;
+				g_last_ctr[ji][sub_idx][flag] = ctr;
 
-				SubState *ss = &g_sub[ji];
+				// Stream name: "<joint>_s<subidx>f<flag>"
+				// e.g. "RightFoot_s0f1", "RightFoot_s2f0"
+				char flagged_label[NAME_LEN + 8];
+				snprintf(flagged_label, sizeof(flagged_label), "%s_s%uf%u",
+				         joint_label, (unsigned)sub_idx, (unsigned)flag);
 
-				// Lock onto the flag of the first frame for this (joint, sub).
-				// Two physical trackers can share the same TDMA slot and differ
-				// only in the flag bit — reject the secondary one.
-				uint8_t flag = frame.sub_type & 0x01;
-				if (!ss->seen) {
-					ss->locked_flag = (int)flag;
-					ss->seen = 1;
-				} else if ((int)flag != ss->locked_flag) {
-					continue;
-				}
-
-				// Orientation: the trained TIC calibrator corrects the device
-				// quaternion's mount/drift (R_clean = R_DGᵀ·R_device·R_BSᵀ) once a
-				// window is ready.  Until then the uncalibrated device quaternion
-				// passes through — there is no complementary-filter fusion.
 				Quat q = frame.quat;
 				Accel a = frame.accel;
+				Accel m = frame.mag;
 
 				uint64_t now = now_ms();
 				double t = (now - g_t_start) * 0.001;
 				uint8_t osc_buf[512];
 
-				// Emit /sinew at sensor rate through the TrackerSink port; the
-				// UDP adapter fans out to the consumer app and the optional
-				// monitor mirror.  app delivery never depends on a monitor.
-				size_t len = build_tracker(osc_buf, joint_label, q.w, q.x, q.y, q.z, t);
+				// Feed accel + mag + quat into the TIC calibrator window.  Once
+				// 32 snapshots are collected the net runs and refreshes per-sensor
+				// R_BS (mount) and R_DG (drift).  Degrades to a no-op when
+				// wtrained.bin / GPU are absent.
+				int sensor_idx = joint_index_for_name(joint_label);
+				if (sensor_idx >= 0) {
+					tic_calib_push(sensor_idx, a, m, q, now);
+				}
+
+				// Apply mount/drift correction: R_clean = R_DGᵀ·R_device·R_BSᵀ.
+				// Returns 1 and writes corrected quat when a calibration is ready;
+				// 0 → pass the raw device quaternion through unchanged.
+				Quat q_out;
+				if (sensor_idx < 0 || !tic_calib_apply(sensor_idx, q, &q_out)) {
+					q_out = q;
+				}
+
+				// Re-normalise before emitting.
+				{
+					float n = sqrtf(q_out.w*q_out.w + q_out.x*q_out.x +
+					                q_out.y*q_out.y + q_out.z*q_out.z);
+					if (n > 1e-9f) {
+						q_out.w /= n; q_out.x /= n; q_out.y /= n; q_out.z /= n;
+					} else {
+						q_out = (Quat){1.f, 0.f, 0.f, 0.f};
+					}
+				}
+
+				// Ignore identity quaternion — it signals low-power / sleeping sensor.
+				// Do not set reference, do not emit, do not include in derived average.
+				if (quat_is_identity(q_out)) continue;
+
+				// mag_calib_push must run BEFORE zero-pose so it sees the absolute
+				// sensor→world orientation (not the relativized one).  Also accumulates
+				// gravity direction (Ag) for the TRIAD bootstrap.
+				if (ji >= 0 && ji < SINEW_JOINT_COUNT && cfg->mag_calib_path[0]) {
+					if (frame.mag_valid)
+						mag_calib_push(ji, q_out, m, a, cfg->mag_calib_path);
+
+					// Capture initial accel+mag for TRIAD (first valid frame per joint).
+					if (!g_init_captured[ji] && frame.mag_valid) {
+						g_a_init[ji] = a;
+						g_m_init[ji] = m;
+						g_init_captured[ji] = 1;
+					}
+
+					// Try TRIAD whenever we have init data but no physics-grounded ref yet.
+					if (g_init_captured[ji] && !g_ref_triad_set[ji]) {
+						float Bg[3], Ag[3];
+						if (mag_calib_get_refs(ji, Bg, Ag)) {
+							Accel m_cal;
+							mag_calib_apply(ji, g_m_init[ji], &m_cal);
+							float a_arr[3] = {g_a_init[ji].x, g_a_init[ji].y, g_a_init[ji].z};
+							float m_arr[3] = {m_cal.x, m_cal.y, m_cal.z};
+							Quat q_triad;
+							if (triad_compute(a_arr, m_arr, Ag, Bg, &q_triad)) {
+								g_ref_triad[ji] = q_triad;
+								g_ref_triad_set[ji] = 1;
+								// Retroactively align all already-active slots to the TRIAD
+								// reference.  Slots that came online before TRIAD was ready
+								// captured a random first-frame as their zero-pose; updating
+								// them here puts every slot in the same reference frame so the
+								// 6D-averaged derived channel tracks ch1/ch2 proportionally.
+								for (int _s = 0; _s < SUB_MAX; _s++)
+									for (int _f = 0; _f < 2; _f++)
+										if (g_ref_set[ji][_s][_f])
+											g_ref_q[ji][_s][_f] = q_triad;
+							}
+						}
+					}
+				}
+
+				// Save absolute orientation before zero-pose.
+				// Accel and magcal are rotated using this so all slots on the same joint
+				// produce the same world-frame direction (q_out is per-slot and differs
+				// across slots with different zero-pose references, causing oscillation).
+				Quat q_abs = q_out;
+
+				// Zero-pose calibration (powerup): capture first frame as reference so
+				// the emitted orientation starts at identity.  Q_emit = inv(Q_ref) * Q_out.
+				// TRIAD gives a physics-grounded reference; fall back to TIC snapshot if not ready.
+				if (ji >= 0 && ji < SINEW_JOINT_COUNT) {
+					if (!g_ref_set[ji][sub_idx][flag]) {
+						g_ref_q[ji][sub_idx][flag] = g_ref_triad_set[ji] ? g_ref_triad[ji] : q_out;
+						g_ref_set[ji][sub_idx][flag] = 1;
+					}
+					Quat r = g_ref_q[ji][sub_idx][flag];
+					// inv(r) * q_out  (unit quaternion: inv = conjugate)
+					Quat ri = {r.w, -r.x, -r.y, -r.z};
+					Quat qr;
+					qr.w = ri.w*q_out.w - ri.x*q_out.x - ri.y*q_out.y - ri.z*q_out.z;
+					qr.x = ri.w*q_out.x + ri.x*q_out.w + ri.y*q_out.z - ri.z*q_out.y;
+					qr.y = ri.w*q_out.y - ri.x*q_out.z + ri.y*q_out.w + ri.z*q_out.x;
+					qr.z = ri.w*q_out.z + ri.x*q_out.y - ri.y*q_out.x + ri.z*q_out.w;
+					float nn = sqrtf(qr.w*qr.w+qr.x*qr.x+qr.y*qr.y+qr.z*qr.z);
+					if (nn > 1e-9f) { qr.w/=nn; qr.x/=nn; qr.y/=nn; qr.z/=nn; }
+					q_out = qr;
+				}
+
+				// Godot spherical_cubic_interpolate phase-aligner:
+				// 1. Align flip phase: Basis(q).get_rotation_quaternion()
+				// 2. Flip to shortest path: signbit(from_q.dot(to_q)) → negate
+				q_out = q_align_phase(q_out);
+				if (ji >= 0 && ji < SINEW_JOINT_COUNT) {
+					Quat *pq = &g_prev_q[ji][sub_idx][flag];
+					float dot = pq->w*q_out.w + pq->x*q_out.x
+					          + pq->y*q_out.y + pq->z*q_out.z;
+					if (dot < 0.f) {
+						q_out.w = -q_out.w; q_out.x = -q_out.x;
+						q_out.y = -q_out.y; q_out.z = -q_out.z;
+					}
+					*pq = q_out;
+				}
+
+				// Emit /sinew at sensor rate through the TrackerSink port.
+				// Use q_abs (pre-zero-pose) so all slots converge on the same world direction.
+				float aw_x, aw_y, aw_z;
+				quat_rotate_vec(q_abs, a.x, a.y, a.z, &aw_x, &aw_y, &aw_z);
+
+				size_t len = build_tracker(osc_buf, flagged_label, q_out.w, q_out.x, q_out.y, q_out.z, t);
 				sink.send(sink.ctx, osc_buf, len);
-				len = build_accel(osc_buf, joint_label, a.x, a.y, a.z);
+				len = build_accel(osc_buf, flagged_label, aw_x, aw_y, aw_z);
 				sink.send(sink.ctx, osc_buf, len);
 
+				// Emit joint lifecycle state for Blender sphere visualisation.
+				if (ji >= 0 && ji < SINEW_JOINT_COUNT) {
+					pthread_mutex_lock(&g_js_mu);
+					int st = (int)g_joint_state[ji].state;
+					pthread_mutex_unlock(&g_js_mu);
+					len = build_state_status(osc_buf, joint_label, st);
+					sink.send(sink.ctx, osc_buf, len);
+				}
+
+				if (frame.mag_valid) {
+					len = build_mag(osc_buf, flagged_label, m.x, m.y, m.z);
+					sink.send(sink.ctx, osc_buf, len);
+
+					// Emit calibrated mag vector in absolute world frame (q_abs) for Blender.
+					if (ji >= 0 && ji < SINEW_JOINT_COUNT && cfg->mag_calib_path[0]) {
+						Accel Bcal;
+						mag_calib_apply(ji, m, &Bcal);
+						float bw_x, bw_y, bw_z;
+						quat_rotate_vec(q_abs, Bcal.x, Bcal.y, Bcal.z, &bw_x, &bw_y, &bw_z);
+						char magcal_label[NAME_LEN + 8];
+						snprintf(magcal_label, sizeof(magcal_label), "%s_magcal", joint_label);
+						len = build_magcal(osc_buf, magcal_label, bw_x, bw_y, bw_z);
+						sink.send(sink.ctx, osc_buf, len);
+						// Calibration progress pie chart (0.0–1.0)
+						float progress = mag_calib_get_progress(ji);
+						len = build_calib_status(osc_buf, joint_label, progress);
+						sink.send(sink.ctx, osc_buf, len);
+
+						// Compass quality = raw magnetometer magnitude (LSB).
+						// Deviates from per-sensor constant when near ferromagnetic objects.
+						float mag_mag = sqrtf(m.x*m.x + m.y*m.y + m.z*m.z);
+						len = build_magqual(osc_buf, joint_label, mag_mag);
+						sink.send(sink.ctx, osc_buf, len);
+					}
+				}
+
+				// Battery level from burst-frame trailing byte 28 (0x3a raw28).
+				// raw28 is 0 for non-burst frames; normalise to 0.0-1.0 assuming 0-100 range.
+				if (frame.raw28 > 0) {
+					float batt = (float)frame.raw28 / 100.f;
+					if (batt > 1.f) batt = 1.f;
+					len = build_battery(osc_buf, joint_label, batt);
+					sink.send(sink.ctx, osc_buf, len);
+				}
+
+				// Mark slot active and emit the 6D-averaged derived channel.
+				// R_clean per slot is already in g_prev_q (tic_calib + phase-aligned).
+				// Average all seen, non-sleeping slots via sixd_to_R → "<joint>_derived".
+				g_slot_seen[ji][sub_idx][flag] = 1;
+				{
+					float v6sum[6] = {0};
+					int n_slots = 0;
+					for (int si = 0; si < SUB_MAX; si++) {
+						for (int fi = 0; fi < 2; fi++) {
+							if (!g_slot_seen[ji][si][fi]) continue;
+							if (quat_is_identity(g_prev_q[ji][si][fi])) continue;
+							float v6[6];
+							quat_to_6d(g_prev_q[ji][si][fi], v6);
+							for (int k = 0; k < 6; k++) v6sum[k] += v6[k];
+							n_slots++;
+						}
+					}
+					if (n_slots >= 2) {
+						Quat qd = sixd_avg_to_quat(v6sum, n_slots);
+						qd = q_align_phase(qd);
+						Quat *pd = &g_prev_q_derived[ji];
+						float ddot = pd->w*qd.w + pd->x*qd.x + pd->y*qd.y + pd->z*qd.z;
+						if (ddot < 0.f) {
+							qd.w=-qd.w; qd.x=-qd.x; qd.y=-qd.y; qd.z=-qd.z;
+						}
+						*pd = qd;
+						char derived_label[NAME_LEN + 10];
+						snprintf(derived_label, sizeof(derived_label), "%s_derived", joint_label);
+						len = build_tracker(osc_buf, derived_label, qd.w, qd.x, qd.y, qd.z, t);
+						sink.send(sink.ctx, osc_buf, len);
+					}
+				}
+
 				if (cfg->verbose) {
-					DLOG(cfg, "[frame] %s sub=%u ctr=%u\n", joint_label, sub_idx, ctr);
+					DLOG(cfg, "[frame] %s flag=%u ctr=%u\n", flagged_label, (unsigned)flag, ctr);
 				}
 			}
 		}

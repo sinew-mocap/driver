@@ -1,8 +1,7 @@
 # driver/ — the rebocap cluster (the ONLY place the rebocap dongle is known).
 # Hexagon: core/ (rebocap frame codec) + ports/ (FrameSource, TrackerSink) +
-# adapters/ (serial source, OSC-out, ftxui TUI).  Depends on the osc cluster for
-# the neutral /sinew contract (build_tracker/build_accel).  No calibration, no
-# Vulkan: streams the device quaternion out as raw /sinew OSC.
+# adapters/ (serial source, OSC-out, ftxui TUI).  Links mount_drift_core for
+# TIC calibration (accel+mag+quat → R_clean); degrades gracefully without weights.
 
 # ── Standalone-build entry (this repo cloned side-by-side in ~/) ──────────────
 # When this cluster is the top-level CMake project, set up the toolchain.  Under
@@ -17,6 +16,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     if(SINEW_TESTS)
         enable_testing()
     endif()
+endif()
+
+# Mount/drift TIC calibrator (accel+mag fusion, Vulkan neural net).
+# Sibling repo at ../mount_drift; degrades gracefully when wtrained.bin absent.
+if(NOT TARGET mount_drift_core)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../mount_drift
+                     ${CMAKE_CURRENT_BINARY_DIR}/mount_drift_build)
 endif()
 
 include(FetchContent)
@@ -34,6 +40,8 @@ add_executable(sinew_tui
     core/sinew_protocol.c
     core/sinew_osc.c
     core/hwid_table.c
+    core/mag_calib.c
+    core/triad_calib.c
 )
 
 # Bake the default hwid/activate ini into the TUI so it ships sane defaults.
@@ -49,6 +57,8 @@ target_include_directories(sinew_tui PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/adapters"   # osc_receiver.hpp, okhsl.hpp, sinew_driver.h
     "${CMAKE_CURRENT_SOURCE_DIR}/core"       # sinew_protocol.h, hwid_table.h, nonic.h
     "${CMAKE_CURRENT_SOURCE_DIR}/ports"      # frame_source.h, tracker_sink.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mount_drift/ports"  # tic_calib.h
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mount_drift/core"   # imu_types.h
 )
 # Version stamped into `sinew_tui --version`: a -DSINEW_VERSION override (the
 # release workflow passes the git tag) wins; otherwise the project() version.
@@ -60,6 +70,7 @@ target_link_libraries(sinew_tui PRIVATE
     ftxui::screen
     ftxui::dom
     ftxui::component
+    mount_drift_core
 )
 
 if(WIN32)
