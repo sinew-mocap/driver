@@ -8,7 +8,10 @@ repos:
         # prek manages the clang-tidy binary via pip; no manual apt-get needed.
         language: python
         additional_dependencies: [clang-tidy]
-        types_or: [c, c++]
+        # Only .c source files: headers are compiled with their .c file, and .cpp
+        # files (proptest.cpp, main.cpp, osc_receiver.cpp) need external deps not
+        # available in the lint job (rapidcheck, ftxui).
+        files: '\.c$'
         # sinew_serial_host.c needs mount_drift sibling headers; the test build covers it.
         exclude: adapters/sinew_serial_host\.c
         entry: clang-tidy
