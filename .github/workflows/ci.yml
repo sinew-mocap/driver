@@ -30,3 +30,13 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=ignore
+
+  brace-lint:
+    name: brace-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # prek installs clang-tidy via pip (additional_dependencies in .pre-commit-config.yaml);
+      # no manual apt-get needed.  sinew_serial_host.c is excluded (needs mount_drift sibling)
+      # and is covered instead by compilation in the test jobs.
+      - uses: j178/prek-action@v2.0.4

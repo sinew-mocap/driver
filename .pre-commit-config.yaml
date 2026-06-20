@@ -1,0 +1,21 @@
+# prek / pre-commit hooks.  Run locally with `prek run --all-files`.
+# CI: the brace-lint job in .github/workflows/ci.yml runs this via j178/prek-action.
+repos:
+  - repo: local
+    hooks:
+      - id: clang-tidy-braces
+        name: C/C++ braces around all blocks (readability-braces-around-statements)
+        # prek manages the clang-tidy binary via pip; no manual apt-get needed.
+        language: python
+        additional_dependencies: [clang-tidy]
+        types_or: [c, c++]
+        # sinew_serial_host.c needs mount_drift sibling headers; the test build covers it.
+        exclude: adapters/sinew_serial_host\.c
+        entry: clang-tidy
+        args:
+          - --checks=-*,readability-braces-around-statements
+          - --warnings-as-errors=readability-braces-around-statements
+          - --extra-arg=-Icore
+          - --extra-arg=-Iports
+          - --extra-arg=-Iadapters
+          - --extra-arg=-std=c11
