@@ -18,3 +18,6 @@ assets/*.bin
 imgui.ini
 .vscode/
 .cache/
+# local machine-specific runtime data
+activates.ini
+hwid_table.ini
