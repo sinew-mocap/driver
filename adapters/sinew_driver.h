@@ -15,6 +15,7 @@ typedef struct {
 	int verbose;
 	FILE *logfp;  // driver writes here; NULL = silent
 	FILE *rawfp;  // every 36-byte frame as `ms,hex72`; NULL = off
+	char mag_calib_path[256];  // INI for online hard+soft iron calibration; "" = disable
 } SinewConfig;
 
 void sinew_config_default(SinewConfig *p_cfg);
