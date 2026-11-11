@@ -69,6 +69,12 @@ structure ImuFrame where
   -- Raw Int16 accelerometer counts before scaling — used to diagnose
   -- wrong scale factors or byte-offset errors across tracker types.
   accelRaw   : Int × Int × Int
+  -- Raw magnetometer counts (bytes 24-29, i16le x3).  C-parity: valid only when
+  -- byte 33 != 0 (standard layout); the shifted layout still reports the bytes.
+  magRaw     : Int × Int × Int
+  magValid   : Bool
+  -- Raw quaternion counts (w, x, y, z) before normalisation, for parity checks.
+  quatRaw    : Int × Int × Int × Int
   deriving Repr
 
 inductive ParseResult where
@@ -170,6 +176,10 @@ def parseFrame (b : ByteArray) : ParseResult :=
                         (getI16LE b Type0x18.quatWOff) (getI16LE b Type0x18.quatXOff)
                         (getI16LE b Type0x18.quatYOff) (getI16LE b Type0x18.quatZOff)
         accel      := rawToAccel ax ay az
+        magRaw     := (getI16LE b 24, getI16LE b 26, getI16LE b 28)
+        magValid   := getU8 b 33 != 0
+        quatRaw    := (getI16LE b Type0x18.quatWOff, getI16LE b Type0x18.quatXOff,
+                       getI16LE b Type0x18.quatYOff, getI16LE b Type0x18.quatZOff)
         accelRaw   := (ax, ay, az)
       }
     else if cls == 0xA then
@@ -191,6 +201,11 @@ def parseFrame (b : ByteArray) : ParseResult :=
                         (getI16LE b Type0x3a.accelXOff)
                         (getI16LE b Type0x3a.accelYOff)
                         (getI16LE b Type0x3a.accelZOff)
+        -- burst frames carry the hardware ID at 24-26, not magnetometer data (C parity: zero, invalid)
+        magRaw     := (0, 0, 0)
+        magValid   := false
+        quatRaw    := (getI16LE b Type0x3a.quatWOff, getI16LE b Type0x3a.quatXOff,
+                       getI16LE b Type0x3a.quatYOff, getI16LE b Type0x3a.quatZOff)
         accelRaw   := (getI16LE b Type0x3a.accelXOff,
                        getI16LE b Type0x3a.accelYOff,
                        getI16LE b Type0x3a.accelZOff)
