@@ -23,3 +23,7 @@ lean_lib SinewDriver where
 -- counterexample (CI-runnable).
 lean_exe proptest where
   root := `Tests
+
+-- Thin raw-log decoder over Sinew.Protocol.parseFrame (no decode logic here).
+lean_exe rawdecode where
+  root := `Tools.RawDecode
