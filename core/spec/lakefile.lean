@@ -39,3 +39,7 @@ lean_exe poweroff where
 -- Per-capture mean pose in 3x3 matrix space (Tools.PoseAngle).
 lean_exe poseangle where
   root := `Tools.PoseAngle
+
+-- Host-capture CSV to frames (Tools.HostCapFrames).
+lean_exe hostcapframes where
+  root := `Tools.HostCapFrames
