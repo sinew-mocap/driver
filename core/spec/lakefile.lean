@@ -17,7 +17,7 @@ lean_lib SinewDriver where
   srcDir := "."
   globs  := #[Glob.andSubmodules `Sinew.Protocol, Glob.one `Sinew.Serial,
               Glob.one `Sinew.Nonic, Glob.one `Sinew.Osc, Glob.one `Sinew.Udp,
-              Glob.one `Sinew.MagCal]
+              Glob.one `Sinew.MagCal, Glob.one `Sinew.Rot3]
 
 -- Property tests over the codec spec.  `lake exe proptest` exits nonzero on a
 -- counterexample (CI-runnable).
@@ -35,3 +35,7 @@ lean_exe recordraw where
 -- One ALL_TRACKERS shutdown_node frame (Tools.Poweroff).
 lean_exe poweroff where
   root := `Tools.Poweroff
+
+-- Per-capture mean pose in 3x3 matrix space (Tools.PoseAngle).
+lean_exe poseangle where
+  root := `Tools.PoseAngle
