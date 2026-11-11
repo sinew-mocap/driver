@@ -26,7 +26,7 @@ def parseHexLine (line : String) : Option ByteArray := Id.run do
   return some out
 
 def hex2 (n : UInt8) : String :=
-  let s := String.mk (Nat.toDigits 16 n.toNat)
+  let s := String.ofList (Nat.toDigits 16 n.toNat)
   if s.length < 2 then "0" ++ s else s
 
 def showResult : ParseResult → String
