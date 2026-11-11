@@ -16,7 +16,8 @@ package "SinewDriver" where
 lean_lib SinewDriver where
   srcDir := "."
   globs  := #[Glob.andSubmodules `Sinew.Protocol, Glob.one `Sinew.Serial,
-              Glob.one `Sinew.Nonic, Glob.one `Sinew.Osc, Glob.one `Sinew.Udp]
+              Glob.one `Sinew.Nonic, Glob.one `Sinew.Osc, Glob.one `Sinew.Udp,
+              Glob.one `Sinew.MagCal]
 
 -- Property tests over the codec spec.  `lake exe proptest` exits nonzero on a
 -- counterexample (CI-runnable).
