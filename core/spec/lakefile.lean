@@ -27,3 +27,7 @@ lean_exe proptest where
 -- Thin raw-log decoder over Sinew.Protocol.parseFrame (no decode logic here).
 lean_exe rawdecode where
   root := `Tools.RawDecode
+
+-- Raw byte-stream recorder with +36 framing (Tools.RecordRaw).
+lean_exe recordraw where
+  root := `Tools.RecordRaw
