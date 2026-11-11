@@ -31,3 +31,7 @@ lean_exe rawdecode where
 -- Raw byte-stream recorder with +36 framing (Tools.RecordRaw).
 lean_exe recordraw where
   root := `Tools.RecordRaw
+
+-- One ALL_TRACKERS shutdown_node frame (Tools.Poweroff).
+lean_exe poweroff where
+  root := `Tools.Poweroff
